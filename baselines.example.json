@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "Baselines for structural_scan.py, measured from YOUR target writer.",
+    "The values here are the placeholder defaults and describe no real person.",
+    "Replace every one of them. See README, 'Calibrate it to your own writer'.",
+    "",
+    "Measure one register at a time. A writer's cold-email numbers and their",
+    "published-content numbers are different, and averaging them produces a",
+    "profile that matches neither. Keep one file per register:",
+    "  baselines.content.json, baselines.email.json, and so on.",
+    "",
+    "corpus_words is the size of the corpus the three raw counts are per, so",
+    "the scanner can rate-normalize a document of any length against it.",
+    "Unknown keys are ignored with a warning."
+  ],
+
+  "label": "example: unnamed writer, marketing-content register, N words",
+
+  "mean_sentence": 20.0,
+  "stdev_sentence": 10.0,
+
+  "pct_short": 10,
+  "pct_long": 15,
+
+  "you_per_corpus": 80,
+  "we_per_corpus": 50,
+  "first_person_per_corpus": 10,
+  "corpus_words": 7500
+}
