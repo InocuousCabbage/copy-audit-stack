@@ -34,6 +34,7 @@ Usage:
 Exit 0 if the family is consistent, 1 if not.
 """
 
+import argparse
 import importlib.util
 import os
 import subprocess
@@ -82,12 +83,25 @@ def load(path):
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--require-all", action="store_true",
+                    help="treat a missing scanner as a failure. Off by default because a "
+                         "partial vendor is a legitimate deployment: a project may install "
+                         "only the scanners it needs. Use this in the canonical repo, where "
+                         "an absent sibling really is a problem.")
+    args = ap.parse_args()
+
     failures = []
+    present, absent = [], []
     for path in SCANNERS:
         name = os.path.basename(path)
         if not os.path.exists(path):
-            failures.append(f"{name}: missing from the repo")
+            absent.append(name)
+            if args.require_all:
+                failures.append(f"{name}: missing, and --require-all was passed")
             continue
+        present.append(name)
 
         r = subprocess.run([sys.executable, path, "--self-test"],
                            capture_output=True, text=True)
@@ -124,12 +138,18 @@ def main():
               f"skip_self={contract.get('skip_self')} "
               f"({contract.get('skip_self_reason', '')[:60]})")
 
+    if absent and not args.require_all:
+        print(f"\n  not installed here, skipped: {', '.join(absent)}")
+        print("  (a partial install is fine; this checks consistency among what is present)")
+    if not present:
+        print("\nFAMILY CHECK FAILED: found none of the scanners at all.")
+        return 1
     if failures:
         print("\nFAMILY CHECK FAILED:")
         for f in failures:
             print(f"  - {f}")
         return 1
-    print(f"\nfamily check PASSED: {len(SCANNERS)} scanners consistent.")
+    print(f"\nfamily check PASSED: {len(present)} scanner(s) consistent.")
     return 0
 
 
