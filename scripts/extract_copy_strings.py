@@ -44,6 +44,13 @@ import os
 import re
 import sys
 
+# Family contract. See scripts/family_check.py.
+FAMILY_CONTRACT = {
+    "skip_self": True,
+    "skip_self_reason": "its docstrings classify as ui-copy and fired 83 times on a vendor-install PR",
+    "clean_scan_caveat": True,
+}
+
 SOURCE_EXT = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".py", ".html"}
 SKIP_DIR = {"node_modules", ".next", ".git", "dist", "build", ".vercel", "__pycache__",
             "__tests__", "tests", "test", "e2e", "cypress", "playwright"}

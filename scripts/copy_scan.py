@@ -33,6 +33,19 @@ import os
 import re
 import sys
 
+# Family contract. Asserted by scripts/family_check.py so a fix applied to one
+# scanner cannot silently skip its siblings. This exists because exactly that
+# happened: extract_copy_strings.py got skip-self enforcement and this file did
+# not, despite carrying a prose description of the same problem since it was
+# written. "Sweep for the class before closing" was a rule I held and did not
+# fire. A prose rule that needs vigilance fails the same way an unencoded
+# scanner rule does, so this one is encoded.
+FAMILY_CONTRACT = {
+    "skip_self": True,
+    "skip_self_reason": "its rule table is literally made of the patterns it detects",
+    "clean_scan_caveat": True,
+}
+
 # (id, severity, compiled pattern, human explanation)
 RULES = [
     ("EM-DASH",     "error", re.compile(r"—"),

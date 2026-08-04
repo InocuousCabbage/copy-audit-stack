@@ -30,6 +30,20 @@ import re
 import statistics as st
 import sys
 
+# Family contract. See scripts/family_check.py.
+#
+# skip_self is False here, and that is a decision rather than an omission. This
+# scanner reads prose and reports statistics; pointed at source it produces
+# meaningless numbers rather than false FINDINGS, and it is never run over a
+# source tree the way the other two are. Declaring the exemption explicitly is
+# the point: the family check fails on a MISSING declaration, not on a False one,
+# so a sibling cannot drift by silence.
+FAMILY_CONTRACT = {
+    "skip_self": False,
+    "skip_self_reason": "reads prose, never pointed at a source tree; produces bad stats not false findings",
+    "clean_scan_caveat": True,
+}
+
 # PLACEHOLDER baselines. Round invented numbers, deliberately not measured from
 # anyone, so that shipping without calibrating is visible rather than silently
 # wrong. Replace via --baselines.
