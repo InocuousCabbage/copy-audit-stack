@@ -29,6 +29,7 @@ Usage:
 """
 
 import argparse
+import os
 import re
 import sys
 
@@ -85,6 +86,25 @@ RULES = [
      "writer's rate before deciding what counts as too many."),
 ]
 
+# Files that ARE this tooling. Pointed at its own source, this scanner flags its
+# own RULE TABLE: the literal strings "seamless", "robust", "cutting-edge" are
+# the patterns it exists to detect, and the rule descriptions contain an em dash.
+# So a repo vendoring this file gets a gate that fails on the PR installing it,
+# then again on every PR touching the tools directory.
+#
+# The SCOPE note at the top of this file has warned about exactly this since it
+# was written, for documentation. It was never enforced in code. extract_copy_
+# strings.py got the enforcement first; this sibling did not, because I fixed the
+# reported instance instead of sweeping the class. Same bug, two tools, one sweep
+# missed.
+SELF_FILES = re.compile(r"(?:^|/)(?:copy_scan|extract_copy_strings|structural_scan)\.py$")
+
+
+def is_self(path):
+    """True if path is a copy of this tooling rather than something to audit."""
+    return bool(SELF_FILES.search(path.replace(os.sep, "/")))
+
+
 # Lines where a term is discussed rather than used. Both the humanizer and
 # structural-humanizer exempt these, so the scanner must too or it fires on its
 # own documentation and gets ignored as noise.
@@ -136,6 +156,10 @@ def main():
     ap.add_argument("files", nargs="*")
     ap.add_argument("--strict", action="store_true", help="exit 1 on any hit")
     ap.add_argument("--errors-only", action="store_true")
+    ap.add_argument("--include-self", action="store_true",
+                    help="scan vendored copies of these scanners too. Off by default: "
+                         "this file's own rule table is made of the patterns it detects, "
+                         "so scanning it produces guaranteed noise and no signal.")
     ap.add_argument("--self-test", action="store_true",
                     help="run against known-bad text and confirm the scanner fires")
     args = ap.parse_args()
@@ -154,6 +178,28 @@ def main():
         if missing:
             print(f"SELF-TEST FAILED, these rules did not fire: {sorted(missing)}")
             return 2
+        # Skip-self, both bounds. The tool must ignore vendored copies of itself
+        # WITHOUT that rule swallowing a real file whose name merely resembles it.
+        sfail = []
+        for pth, want in [("tools/copy_scan.py", True),
+                          ("vendor/extract_copy_strings.py", True),
+                          ("src/app/page.tsx", False),
+                          ("content/copy_scan_notes.md", False),
+                          ("src/copy_scanner.tsx", False)]:
+            if is_self(pth) != want:
+                sfail.append(f"is_self({pth}) = {is_self(pth)}, expected {want}")
+        # positive control: scanning this file WITH --include-self must still find
+        # its own rule table, or the suppression is hiding a broken scanner.
+        own, _ = scan(__file__, skip_meta=False)
+        if not own:
+            sfail.append("positive control: scanning own source found nothing, "
+                         "so skip-self would be suppressing an already-dead check")
+        if sfail:
+            for f in sfail:
+                print(f"SELF-TEST FAILED: {f}")
+            return 2
+        print(f"skip-self PASSED: identifies vendored copies, spares lookalikes, "
+              f"and own source still yields {len(own)} hits when included.")
         print("self-test PASSED: scanner fires on known-bad input.")
         return 0
 
@@ -161,7 +207,11 @@ def main():
         ap.error("need files, or --self-test")
 
     total = 0
+    skipped = []
     for path in args.files:
+        if not args.include_self and is_self(path):
+            skipped.append(path)
+            continue
         hits, err = scan(path)
         if err:
             continue
@@ -174,7 +224,12 @@ def main():
                 print(f"         {why}")
             total += len(hits)
 
-    print(f"\n{total} hit(s) across {len(args.files)} file(s)")
+    if skipped:
+        print(f"\nskipped {len(skipped)} vendored copy(ies) of this tooling: "
+              f"{', '.join(skipped)}")
+        print("  (their rule tables are made of the patterns this scans for; "
+              "pass --include-self to scan them anyway)")
+    print(f"\n{total} hit(s) across {len(args.files) - len(skipped)} scanned file(s)")
     print("NOTE: a clean scan does not mean pass 1 passed. This catches only the")
     print("      pattern-matchable slice; judgment-level tells stay with the skill.")
     return 1 if (args.strict and total) else 0
