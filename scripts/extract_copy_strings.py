@@ -58,18 +58,60 @@ CODEISH = re.compile(
 )
 # Utility-class strings. Two tests: starts-with a known prefix, OR is composed
 # ENTIRELY of hyphenated utility tokens (catches "size-5 shrink-0 text-primary",
-# which starts with a prefix that was not on the list). Enumerating prefixes is
-# the same mistake as encoding one phrasing of a concept in copy_scan.py: the
+# which starts with a prefix I had not listed). Enumerating prefixes is the same
+# mistake as encoding one phrasing of a concept in copy_scan.py: the
 # enumeration is always incomplete, so test the SHAPE as well as the members.
 TAILWINDISH = re.compile(r"^(?:[a-z-]+:)?(?:flex|grid|text-|bg-|p[xytblr]?-|m[xytblr]?-|w-|h-|size-|border|rounded|gap-|font-|items-|justify-|shrink|grow|inline|absolute|relative|space-|leading-|tracking-)")
-ALL_UTILITY = re.compile(r"^(?:[a-z0-9]+(?:[-:/][a-z0-9.\[\]%#]+)+\s*)+$", re.I)
+_UTIL_TOKEN = re.compile(r"^[a-z0-9]+(?:[-:/][a-z0-9.\[\]%#]+)*$")   # lowercase on purpose
+
+
+def looks_like_utility_classes(s):
+    """True for a Tailwind-style class list, false for prose.
+
+    Not a regex, and the reason is a bug I shipped into this very function.
+    The original required every token to contain a hyphen, so one bare token
+    ("flex") was enough to break the match and "min-h-full flex flex-col" got
+    reported as copy against a real dashboard tree. Relaxing the hyphen
+    requirement then over-corrected: with bare tokens allowed, the pattern
+    matched "Your marketing audit is ready to review" and suppressed real copy.
+    My own self-test caught that, which is the only reason it is not shipped.
+
+    Both bounds need to hold at once, and expressing that as one regex is how
+    the first version went wrong. So state it plainly:
+      - at least two tokens
+      - every token is lowercase and utility-shaped (prose has capitals)
+      - at least half the tokens are actually hyphenated
+    A prose line containing one hyphenated word fails the last condition, which
+    is the case a hyphen-anywhere lookahead would have wrongly suppressed.
+    """
+    tokens = s.split()
+    if len(tokens) < 2:
+        return False
+    if not all(_UTIL_TOKEN.match(t) for t in tokens):
+        return False
+    hyphenated = sum(1 for t in tokens if re.search(r"[-:/]", t))
+    return hyphenated * 2 >= len(tokens)
+
+# Machine-language strings that read as prose to the extractor: SQL, HTTP verb
+# lists, viewport/meta directives, MIME and header values. Found by scanning a
+# real Next.js dashboard tree, where SELECT statements and
+# "width=device-width, initial-scale=1" were being reported as ui-copy.
+MACHINEISH = re.compile(
+    r"^\s*(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH|PRAGMA)\s|"
+    r"^\s*\(?\s*(?:title|assignee|project|status|id)\s+(?:LIKE|IN|=)\s|"
+    r"\bwidth=device-width|initial-scale=|user-scalable=|"
+    r"^(?:GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)(?:\s*,\s*(?:GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD))+$|"
+    r"^[a-z]+/[a-z0-9.+-]+(?:;\s*\w+=|$)",
+    re.I)
 
 
 def looks_like_copy(s):
     s = s.strip()
     if len(s) < 12 or len(s) > 600:
         return False
-    if CODEISH.match(s) or TAILWINDISH.match(s) or ALL_UTILITY.match(s):
+    if CODEISH.match(s) or TAILWINDISH.match(s) or looks_like_utility_classes(s):
+        return False
+    if MACHINEISH.search(s):
         return False
     if CODEY.search(s):        # slab of JSX/TS that slipped through
         return False
@@ -114,6 +156,24 @@ CODEY = re.compile(r"(?:</|/>|=>|className|useState|useRef|useEffect|import |exp
                    r"function |return \(|\{\s*\}|\bconst \b|\blet \b|;\s*$|\)\s*;|"
                    r"aria-hidden|tabIndex|onClick|\bprops\b|=\{)")
 
+# DEVELOPER-facing strings, which are not the rendered surface this gate exists
+# to protect. Found by running diff mode against a real backend commit: it
+# flagged two console.warn messages out of a scheduling module as "ui-copy",
+# because genre_for() defaults anything unrecognised to ui-copy. Nobody outside
+# the repo ever reads those. Left in, the gate fires on ordinary backend work,
+# reviewers learn the noise is safe to skip, and the one real hit goes with it.
+# That is the untrustworthy-check failure, and it is worse than no gate.
+# Matched against the source immediately BEFORE the string, not the string
+# itself, because the tell is the call site rather than the wording.
+LOGGISH = re.compile(
+    r"(?:console\.(?:log|warn|error|info|debug|trace)|"
+    r"logger?\.(?:log|warn|error|info|debug|trace)|"
+    r"\bthrow\s+new\s+\w*Error|new\s+\w*Error|"
+    r"\bassert\w*|process\.(?:stdout|stderr)\.write|"
+    r"\bdebug\(|\bwarn\(|\bpanic\(|\bfatal\()"
+    r"\s*\(?\s*(?:`|\"|')?\s*$")
+LOG_LOOKBEHIND = 80   # chars of preceding source to inspect
+
 
 def walk(paths):
     for p in paths:
@@ -127,6 +187,43 @@ def walk(paths):
                     yield os.path.join(root, f)
 
 
+def strings_in(src, path):
+    """Pull copy-shaped strings out of one blob of source. Shared by tree mode
+    and diff mode so the two can never drift in what counts as copy."""
+    found = []
+    # drop import lines and comments, which carry non-copy strings
+    src = re.sub(r"(?m)^\s*import .*$", "", src)
+    src = re.sub(r"//[^\n]*", "", src)
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    matches = list(STRING_RE.finditer(src)) + list(TEMPLATE_RE.finditer(src))
+    for m in matches:
+        val = m.group("val")
+        # unescape the common cases only
+        val = val.replace("\\n", " ").replace('\\"', '"').replace("\\'", "'")
+        val = re.sub(r"\$\{[^}]*\}", "…", val)   # template interpolations
+        val = " ".join(val.split())
+        if not looks_like_copy(val):
+            continue
+        # Skip developer-facing strings (log lines, thrown errors). See LOGGISH.
+        before = src[max(0, m.start() - LOG_LOOKBEHIND):m.start()]
+        if LOGGISH.search(before):
+            continue
+        line = src[: m.start()].count("\n") + 1
+        key = m.groupdict().get("key")
+        found.append((genre_for(key, path), path, line, val))
+    return found
+
+
+def dedupe(found):
+    seen, out = set(), []
+    for g, p, l, v in found:
+        if (g, v) in seen:
+            continue
+        seen.add((g, v))
+        out.append((g, p, l, v))
+    return out
+
+
 def extract(paths):
     found = []
     for path in walk(paths):
@@ -134,28 +231,79 @@ def extract(paths):
             src = open(path, encoding="utf-8", errors="replace").read()
         except OSError:
             continue
-        # drop import lines and comments, which carry non-copy strings
-        src = re.sub(r"(?m)^\s*import .*$", "", src)
-        src = re.sub(r"//[^\n]*", "", src)
-        src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
-        matches = list(STRING_RE.finditer(src)) + list(TEMPLATE_RE.finditer(src))
-        for m in matches:
-            val = m.group("val")
-            # unescape the common cases only
-            val = val.replace("\\n", " ").replace('\\"', '"').replace("\\'", "'")
-            val = re.sub(r"\$\{[^}]*\}", "…", val)   # template interpolations
-            val = " ".join(val.split())
-            if looks_like_copy(val):
-                line = src[: m.start()].count("\n") + 1
-                key = m.groupdict().get("key")
-                found.append((genre_for(key, path), path, line, val))
-    # dedupe on (genre, text)
-    seen, out = set(), []
-    for g, p, l, v in found:
-        if (g, v) in seen:
+        found.extend(strings_in(src, path))
+    return dedupe(found)
+
+
+def extract_from_diff(ref, repo="."):
+    """Return copy strings that this diff ADDS.
+
+    Why added-lines-only rather than diffing the extraction of two trees: the
+    routing gate asks 'does this PR introduce new user-facing prose', and a
+    whole-tree comparison answers a slower, different question. Reconstructing
+    a pseudo-source from '+' lines does break constructs that span lines, but
+    it breaks them in the safe direction: a partially-added template literal
+    still surfaces its added text.
+
+    A pure MOVE shows up as an identical string on both a '-' and a '+' line.
+    That is not new copy and is suppressed. An EDIT produces different text on
+    the '+' side and does fire, which is the 'or substantially rewritten' half
+    of the trigger.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo, "diff", "--unified=0", "--no-color", ref],
+            capture_output=True, text=True, check=True).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise RuntimeError(f"git diff failed: {exc}") from exc
+    return copy_in_diff_text(out)
+
+
+def copy_in_diff_text(diff):
+    """Split out from extract_from_diff so it can be tested on diff text
+    directly, without needing a subprocess."""
+    added, removed, path = {}, {}, None
+    for line in diff.split("\n"):
+        if line.startswith("+++ b/"):
+            p = line[6:].strip()
+            path = p if (os.path.splitext(p)[1] in SOURCE_EXT
+                         and not SKIP_FILE.search(os.path.basename(p))
+                         and not any(d in p.split("/") for d in SKIP_DIR)) else None
             continue
-        seen.add((g, v))
-        out.append((g, p, l, v))
+        if line.startswith(("--- ", "+++ ", "@@", "diff --git", "index ")):
+            continue
+        if path is None:
+            continue
+        if line.startswith("+"):
+            added.setdefault(path, []).append(line[1:])
+        elif line.startswith("-"):
+            removed.setdefault(path, []).append(line[1:])
+
+    # Report ADDED, REMOVED and MODIFIED. An earlier version reported only
+    # additions; review corrected the rule to any diff touching a
+    # classified-genre string, because "was this substantially rewritten" is a
+    # taste judgment and a rule that needs one erodes to nothing. Deleting
+    # user-facing copy is a copy decision too, so removals are in scope.
+    #
+    # Pure MOVES are still suppressed, and that is not a judgment call: it is an
+    # exact text match on both sides of the diff. The string did not change, so
+    # there is nothing to review.
+    found = []
+    for p in set(added) | set(removed):
+        new = strings_in("\n".join(added.get(p, [])), p)
+        old = strings_in("\n".join(removed.get(p, [])), p)
+        new_v = {f[3] for f in new}
+        old_v = {f[3] for f in old}
+        found.extend([("+", ) + f for f in new if f[3] not in old_v])
+        found.extend([("-", ) + f for f in old if f[3] not in new_v])
+    # dedupe on (sign, genre, text)
+    seen, out = set(), []
+    for sign, g, p, l, v in found:
+        if (sign, g, v) in seen:
+            continue
+        seen.add((sign, g, v))
+        out.append((sign, g, p, l, v))
     return out
 
 
@@ -177,8 +325,32 @@ def main():
     ap.add_argument("paths", nargs="*")
     ap.add_argument("-o", "--out")
     ap.add_argument("--by-genre", action="store_true")
+    ap.add_argument("--diff", metavar="REF",
+                    help="report only copy strings this diff ADDS, versus REF "
+                         "(e.g. origin/main, HEAD~1). Exits 1 if any are found, "
+                         "so it can gate a mixed code+copy PR.")
+    ap.add_argument("--repo", default=".", help="repo root for --diff (default: cwd)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
+
+    if args.diff:
+        try:
+            res = extract_from_diff(args.diff, args.repo)
+        except RuntimeError as exc:
+            print(exc, file=sys.stderr)
+            return 2
+        if not res:
+            print(f"no user-facing copy changed versus {args.diff}.")
+            return 0
+        print(f"{len(res)} user-facing string change(s) versus {args.diff}.")
+        print("Route to the copy pass before merge.\n")
+        for sign, g, p, l, v in res:
+            what = "added" if sign == "+" else "removed"
+            print(f"  {sign} [{g}] {p}: {v}   ({what})")
+        print("\nNOTE: this flags that copy changed, not that it is wrong. Triage is")
+        print("      expected to be fast on trivial ones. A clean result is not a pass:")
+        print("      it means no classified-genre string moved, nothing more.")
+        return 1
 
     if args.self_test:
         import tempfile
@@ -202,7 +374,71 @@ def main():
         if "email-subject" not in genres:
             print("\nSELF-TEST FAILED: subject line not genre-tagged")
             return 2
-        print("\nself-test PASSED: extracts copy, rejects code, tags genre.")
+        print("  tree mode PASSED: extracts copy, rejects code, tags genre.")
+
+        # --- diff mode, on a REAL git repo and a REAL diff ---
+        # Not a hand-written diff fixture. A hand-written one would encode my
+        # assumptions about git's output format, and the whole point is to
+        # verify against what git actually emits.
+        import subprocess
+        rd = tempfile.mkdtemp()
+
+        def g(*a):
+            return subprocess.run(["git", "-C", rd, *a], capture_output=True,
+                                  text=True, check=True).stdout
+
+        g("init", "-q")
+        g("config", "user.email", "t@t"); g("config", "user.name", "t")
+        base = ('const subject = "Your quarterly impact report is ready";\n'
+                'const blurb = "We help small teams ship better software faster";\n'
+                'const cls = "flex items-center gap-4 rounded-lg";\n')
+        open(os.path.join(rd, "app.ts"), "w").write(base)
+        g("add", "-A"); g("commit", "-qm", "base")
+
+        after = ('const cls = "flex items-center gap-4 rounded-lg";\n'          # MOVED
+                 'const subject = "Your quarterly impact report is ready";\n'   # MOVED
+                 'const blurb = "We help small teams ship software with less friction";\n'  # EDITED
+                 'const cta = "Book a walkthrough with our team today";\n'      # ADDED
+                 'const pad = "px-4 py-2 text-sm font-medium";\n'               # ADDED, utility
+                 # ADDED, developer-facing. Real instance: diff mode flagged two
+                 # console.warn lines out of a live backend commit as ui-copy.
+                 'console.warn("computeStaleThreshold: config is unparseable, falling back");\n'
+                 'throw new Error("Could not resolve the requested agent identifier");\n')
+        open(os.path.join(rd, "app.ts"), "w").write(after)
+        g("add", "-A"); g("commit", "-qm", "change")
+
+        dres = extract_from_diff("HEAD~1", rd)
+        dvals = {v for _, _, _, _, v in dres}
+        dadded = {v for sg, _, _, _, v in dres if sg == "+"}
+        for sg, g_, p_, l_, v_ in dres:
+            print(f"  [diff] {sg} [{g_}] {v_[:70]}")
+
+        must_fire = {
+            "Book a walkthrough with our team today":                  "newly added string",
+            "We help small teams ship software with less friction":    "edited string (rewritten)",
+        }
+        must_not_fire = {
+            "Your quarterly impact report is ready":  "moved verbatim, not new copy",
+            "px-4 py-2 text-sm font-medium":          "added utility classes, not copy",
+            "flex items-center gap-4 rounded-lg":     "moved utility classes",
+            "computeStaleThreshold: config is unparseable, falling back":
+                "console.warn line, developer-facing not user-facing",
+            "Could not resolve the requested agent identifier":
+                "thrown Error message, developer-facing; note it reads like copy",
+        }
+        fails = [f"did not fire on {d}: {s!r}" for s, d in must_fire.items() if s not in dvals]
+        fails += [f"wrongly fired on {d}: {s!r}" for s, d in must_not_fire.items() if s in dvals]
+
+        # positive control: the checker must be capable of failing at all
+        if not copy_in_diff_text("+++ b/x.ts\n+const h = \"A brand new headline for the page\";\n"):
+            fails.append("positive control failed: checker did not fire on known-dirty diff text")
+
+        if fails:
+            for f in fails:
+                print(f"  SELF-TEST FAILED: {f}")
+            return 2
+        print("  diff mode PASSED: fires on added and rewritten copy, silent on moves and utilities.")
+        print("\nself-test PASSED (tree + diff).")
         return 0
 
     if not args.paths:
