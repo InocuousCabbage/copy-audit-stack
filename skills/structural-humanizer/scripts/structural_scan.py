@@ -19,6 +19,7 @@ are meaningless. See the repo README, "Calibrate it to your own writer".
 Usage:
     python3 structural_scan.py FILE [FILE...]
     python3 structural_scan.py --baselines baselines.json FILE
+    python3 structural_scan.py --genre email FILE
     python3 structural_scan.py --strict FILE
     python3 structural_scan.py --self-test
 """
@@ -52,6 +53,23 @@ STDEV_FLOOR = 7.0             # below this, cadence reads as machine-even
 STDEV_CEILING = 25.0          # above this, the input is not prose (tables/specs/long lines)
 MIN_ROBUST_N = 80             # below this sentence count, cadence calls are noise-dominated
 STDEV_MARGIN = 1.0            # within this of the floor, do not assert
+
+# Which checks are meaningful per genre. The cadence and person-balance checks
+# are calibrated on LONG-FORM published content, and firing them on other genres
+# is an instrument bug rather than a finding.
+#
+# Found by running this scanner on a cold email written in the target writer's
+# own defended register: it warned that the prose was "over-chopped" because no
+# sentence exceeded 30 words. Short sentences and a high first-person count are
+# CORRECT for cold outreach. An instrument that flags correct writing teaches
+# its user to ignore it, and then it is worse than not running.
+GENRE_CHECKS = {
+    # genre:      length-band warnings, person-balance warnings
+    "content":    (True,  True),
+    "email":      (False, False),   # short is right; first person is expected
+    "social":     (False, False),   # too short for either to mean anything
+    "landing":    (False, True),    # fragments are normal; reader-facing still holds
+}
 
 # Anchored to SENTENCE start (line start or after terminal punctuation), not line
 # start alone: these markers appear mid-paragraph in real prose, and a line-only
@@ -100,8 +118,9 @@ def sentences(text):
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.split()) >= 2]
 
 
-def analyze(path, base=None):
+def analyze(path, base=None, genre="content"):
     base = base or dict(BASE)
+    do_length, do_person = GENRE_CHECKS.get(genre, GENRE_CHECKS["content"])
     with open(path, encoding="utf-8", errors="replace") as fh:
         text = fh.read()
 
@@ -170,12 +189,16 @@ def analyze(path, base=None):
             out.append(("ERROR", f"CADENCE UNIFORMITY: stdev {sd:.1f} is below {STDEV_FLOOR}. "
                                  "Even mid-length rhythm is the strongest machine tell. "
                                  f"Vary sentence length; baseline is {base['stdev_sentence']}."))
-    if long_ < 5:
-        out.append(("WARN", f"only {long_:.0f}% of sentences exceed 30 words "
-                            f"(base {base['pct_long']}%). Prose may be over-chopped."))
-    if short < 3:
-        out.append(("WARN", f"only {short:.0f}% short sentences (base {base['pct_short']}%). "
-                            "No rhythmic contrast."))
+    if do_length:
+        if long_ < 5:
+            out.append(("WARN", f"only {long_:.0f}% of sentences exceed 30 words "
+                                f"(base {base['pct_long']}%). Prose may be over-chopped."))
+        if short < 3:
+            out.append(("WARN", f"only {short:.0f}% short sentences (base {base['pct_short']}%). "
+                                "No rhythmic contrast."))
+    else:
+        out.append(("INFO", f"genre={genre}: sentence-length band checks skipped. They are "
+                            "calibrated on long-form content and would misreport here."))
 
     for label, rx, msg in [
         ("TAKEAWAY-MARKER", TAKEAWAY, "Explicit takeaway marker. State the point once, where it lands hardest."),
@@ -196,11 +219,11 @@ def analyze(path, base=None):
     out.append(("STAT", f"you/your {you} | we/our {we} | I {i} "
                         f"(base {base['you_per_corpus']}/{base['we_per_corpus']}/"
                         f"{base['first_person_per_corpus']} per {cw:,}w)"))
-    if we > you and words > 300 and base["you_per_corpus"] > base["we_per_corpus"]:
+    if do_person and we > you and words > 300 and base["you_per_corpus"] > base["we_per_corpus"]:
         out.append(("WARN", "we/our outnumbers you/your, which inverts the baseline. "
                             "Most marketing content writes to the reader, not about the company."))
     fp_rate = i / words * cw
-    if fp_rate > base["first_person_per_corpus"] * 4 and words > 300:
+    if do_person and fp_rate > base["first_person_per_corpus"] * 4 and words > 300:
         out.append(("WARN", f"first-person density high for content genre (~{fp_rate:.0f} "
                             f"per {cw:,}w vs baseline {base['first_person_per_corpus']}). "
                             "Often correct for cold-email, off-voice for marketing content."))
@@ -257,6 +280,10 @@ def main():
     ap.add_argument("--baselines", metavar="JSON",
                     help="path to your measured baselines (see baselines.example.json). "
                          "Without this, comparisons use placeholders and mean little.")
+    ap.add_argument("--genre", default="content", choices=sorted(GENRE_CHECKS),
+                    help="which checks are meaningful for this text (default: content). "
+                         "email/social suppress the length-band and person-balance checks, "
+                         "which are calibrated on long-form content.")
     ap.add_argument("--strict", action="store_true", help="exit 1 on any ERROR")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -314,7 +341,7 @@ def main():
     errs = 0
     for path in args.files:
         print(f"\n{path}")
-        res, _ = analyze(path, base)
+        res, _ = analyze(path, base, args.genre)
         for lvl, msg in res:
             print(f"  [{lvl:<5}] {msg}")
             if lvl == "ERROR":
