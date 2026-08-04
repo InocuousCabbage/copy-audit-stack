@@ -23,7 +23,20 @@ Pipe the output into copy_scan.py:
 
 Usage:
     python3 extract_copy_strings.py PATH [PATH...] [-o OUT] [--by-genre]
+    python3 extract_copy_strings.py --diff origin/main...HEAD [PATH...] [--exclude REGEX]
     python3 extract_copy_strings.py --self-test
+
+Using --diff as a CI gate, notes from wiring it into a real Node pipeline:
+
+  - Check out with fetch-depth 0. The default shallow clone has no origin/main
+    to diff against, and the step fails for a reason unrelated to copy.
+  - Use three-dot (origin/main...HEAD), not two-dot. Two-dot includes changes
+    that landed on main since the branch point and blames them on this PR.
+  - Run it on pull_request events only. On a push-to-main event the diff is
+    empty by construction, so every step passes while checking nothing. That
+    is a green tick standing in for coverage, which is worse than no gate.
+  - Scope it: pass src/ (or whatever your product tree is) so the gate does not
+    fire on tooling. Vendored copies of these scanners are skipped by default.
 """
 
 import argparse
@@ -235,7 +248,28 @@ def extract(paths):
     return dedupe(found)
 
 
-def extract_from_diff(ref, repo="."):
+# Files that ARE this tooling. A repo that vendors these scripts will otherwise
+# have the gate fire on the scanners' own docstrings: 83 hits on the very PR
+# that installs them, none of it product copy. copy_scan.py has carried a SCOPE
+# note about exactly this since it was written, and diff mode shipped without
+# applying it. A gate that fails the PR installing it, then fires on every later
+# PR touching tools/, teaches people to ignore it on day one. That is the
+# untrustworthy-check failure arriving before the check has ever been useful.
+SELF_FILES = re.compile(r"(?:^|/)(?:extract_copy_strings|copy_scan|structural_scan)\.py$")
+
+
+def _path_allowed(path, include=None, exclude=None, skip_self=True):
+    if skip_self and SELF_FILES.search(path):
+        return False
+    if exclude and any(re.search(pat, path) for pat in exclude):
+        return False
+    if include:
+        # match tree mode: a path argument scopes the run
+        return any(path == inc or path.startswith(inc.rstrip("/") + "/") for inc in include)
+    return True
+
+
+def extract_from_diff(ref, repo=".", include=None, exclude=None, skip_self=True):
     """Return copy strings that this diff ADDS.
 
     Why added-lines-only rather than diffing the extraction of two trees: the
@@ -257,10 +291,10 @@ def extract_from_diff(ref, repo="."):
             capture_output=True, text=True, check=True).stdout
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         raise RuntimeError(f"git diff failed: {exc}") from exc
-    return copy_in_diff_text(out)
+    return copy_in_diff_text(out, include=include, exclude=exclude, skip_self=skip_self)
 
 
-def copy_in_diff_text(diff):
+def copy_in_diff_text(diff, include=None, exclude=None, skip_self=True):
     """Split out from extract_from_diff so it can be tested on diff text
     directly, without needing a subprocess."""
     added, removed, path = {}, {}, None
@@ -269,7 +303,8 @@ def copy_in_diff_text(diff):
             p = line[6:].strip()
             path = p if (os.path.splitext(p)[1] in SOURCE_EXT
                          and not SKIP_FILE.search(os.path.basename(p))
-                         and not any(d in p.split("/") for d in SKIP_DIR)) else None
+                         and not any(d in p.split("/") for d in SKIP_DIR)
+                         and _path_allowed(p, include, exclude, skip_self)) else None
             continue
         if line.startswith(("--- ", "+++ ", "@@", "diff --git", "index ")):
             continue
@@ -322,7 +357,9 @@ const hex = "#1a2b3c";
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("paths", nargs="*")
+    ap.add_argument("paths", nargs="*",
+                    help="paths to scan. In --diff mode these SCOPE the diff, the same "
+                         "way they scope a tree walk.")
     ap.add_argument("-o", "--out")
     ap.add_argument("--by-genre", action="store_true")
     ap.add_argument("--diff", metavar="REF",
@@ -330,12 +367,20 @@ def main():
                          "(e.g. origin/main, HEAD~1). Exits 1 if any are found, "
                          "so it can gate a mixed code+copy PR.")
     ap.add_argument("--repo", default=".", help="repo root for --diff (default: cwd)")
+    ap.add_argument("--exclude", action="append", metavar="REGEX", default=[],
+                    help="skip paths matching REGEX in --diff mode; repeatable")
+    ap.add_argument("--include-self", action="store_true",
+                    help="do NOT skip vendored copies of these scanners (default is to skip "
+                         "them, so a repo vendoring this tool is not gated on its own docstrings)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
     if args.diff:
         try:
-            res = extract_from_diff(args.diff, args.repo)
+            res = extract_from_diff(args.diff, args.repo,
+                                    include=args.paths or None,
+                                    exclude=args.exclude,
+                                    skip_self=not args.include_self)
         except RuntimeError as exc:
             print(exc, file=sys.stderr)
             return 2
@@ -438,6 +483,36 @@ def main():
                 print(f"  SELF-TEST FAILED: {f}")
             return 2
         print("  diff mode PASSED: fires on added and rewritten copy, silent on moves and utilities.")
+
+        # Scoping. A repo that vendors these scanners must not be gated on the
+        # scanners' own docstrings: that fired 83 times on a real vendor-install
+        # PR, none of it product copy. Both bounds are asserted, because a skip
+        # rule that also swallows product copy is the mirror failure.
+        sd = ('+++ b/tools/extract_copy_strings.py\n'
+              '+"""Pull external-facing text out of source files for review."""\n'
+              '+++ b/src/app/page.tsx\n'
+              '+const h = "Book a walkthrough with our team today";\n'
+              '+++ b/docs/notes.ts\n'
+              '+const n = "An internal note that should be excludable here";\n')
+        prod = "Book a walkthrough with our team today"
+        selfdoc = "Pull external-facing text out of source files for review."
+        vals = lambda **kw: {v for *_, v in copy_in_diff_text(sd, **kw)}
+        sfail = []
+        if selfdoc in vals():
+            sfail.append("default did not skip a vendored copy of this scanner")
+        if prod not in vals():
+            sfail.append("default skipped real product copy")
+        if selfdoc not in vals(skip_self=False):
+            sfail.append("--include-self did not restore the vendored copy")
+        if vals(include=["src/"]) != {prod}:
+            sfail.append("path scoping in diff mode did not restrict to src/")
+        if "An internal note that should be excludable here" in vals(exclude=[r"^docs/"]):
+            sfail.append("--exclude did not drop the excluded path")
+        if sfail:
+            for f in sfail:
+                print(f"  SELF-TEST FAILED: {f}")
+            return 2
+        print("  scoping PASSED: skips vendored self, honors paths and --exclude, keeps product copy.")
         print("\nself-test PASSED (tree + diff).")
         return 0
 
