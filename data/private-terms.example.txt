@@ -1,0 +1,57 @@
+# private-terms.example.txt
+#
+# EXAMPLE ONLY. Every term below is invented. This file describes nobody, and
+# private_scan.py says so on every run until you point --terms at your own list.
+#
+# YOUR REAL LIST DOES NOT BELONG IN A PUBLIC REPO. An enumeration of the things
+# you must not publish is itself a thing you must not publish: it names your
+# clients, your colleagues and your internal systems in one convenient place.
+# Keep it beside the private repo it protects, or somewhere else outside version
+# control that is public.
+#
+# FORMAT
+#   one term per line, matched case-insensitively at word boundaries
+#   # starts a comment
+#   ~ starts an out-of-domain guard (see below)
+#
+# WORD BOUNDARIES ARE WHY THIS IS A LIST AND NOT A REGEX. A short first name
+# matched as a substring fires inside ordinary words, and a gate that cries wolf
+# on normal prose is switched off within a day.
+#
+# THE LIST GOES STALE. That is its main failure mode and it is silent: a client
+# onboarded next month is not in here, and the gate keeps reporting clean while
+# no longer covering them. Add a name when the relationship starts, not when you
+# are about to publish something. If your org has a checklist for taking on a
+# client, this file belongs on it.
+
+# --- people ---------------------------------------------------------------
+# Colleagues, clients, contacts. First names count: they are the ones that end
+# up in example placeholders, where they read as generic until someone notices
+# the repo owner has that name.
+Alvarez
+Okonkwo
+
+# --- organisations --------------------------------------------------------
+# Clients, partners, and any org whose relationship with you is not public.
+Acmecorp
+WidgetInc
+
+# --- internal systems -----------------------------------------------------
+# Private repos, internal tool names, agent or service handles, host names.
+# These leak structure rather than identity, which is easy to under-rate: a path
+# naming an internal directory tells a reader what exists and who it is for.
+orbital-relay
+pipeline-warden
+
+# --- out-of-domain guards -------------------------------------------------
+# A guard suppresses a term match when the surrounding line looks like the
+# innocent sense of the word. Guards exist because some names collide with
+# ordinary vocabulary, and an instrument firing on out-of-domain input is a bug
+# in the instrument rather than a finding.
+#
+# Add a guard ONLY after you have seen the false positive. A speculative guard
+# is indistinguishable from a hole, and it will be the hole your real leak walks
+# through. Each one below should name the collision it was written for.
+
+# "widget factory" is ordinary manufacturing vocabulary and not the client
+~widget factory
