@@ -50,7 +50,15 @@ ROOT = os.path.dirname(HERE)
 # is the failure this tool exists to prevent, so it must not be the tool's own
 # behaviour. Verified by running it in both layouts rather than reasoning about
 # them: the hardcoded version passed here and failed there.
-SCANNER_NAMES = ["copy_scan.py", "extract_copy_strings.py", "structural_scan.py"]
+# Hardcoded rather than globbed, so a file that merely looks like a scanner does
+# not silently join the family. The cost is that a NEW sibling has to be added
+# here, and that cost is real: private_scan.py passed its own self-test while
+# this check still reported three consistent scanners, so for a few minutes a
+# fourth sibling existed outside the family whose entire purpose is that no
+# sibling exists outside it. If you add a scanner, add it here in the same
+# commit.
+SCANNER_NAMES = ["copy_scan.py", "extract_copy_strings.py", "structural_scan.py",
+                 "private_scan.py"]
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "dist", "build"}
 
 
