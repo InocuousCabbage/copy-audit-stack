@@ -35,13 +35,108 @@ Usage:
     python3 scripts/private_scan.py --terms FILE --diff origin/main...HEAD
     python3 scripts/private_scan.py --terms FILE --paths some/file.md other/
     python3 scripts/private_scan.py --self-test
+
+Exit codes. Read the exit code of THIS command, not of anything you pipe it
+into: a pipeline reports the status of its last element, so `private_scan | tail`
+returns tail's success and will report a run that found leaks as clean.
+
+    0  no errors on the added lines
+    1  at least one error-level hit. Do not commit.
+    2  --self-test failed. The gate itself is broken; fix it before trusting a 0.
+    3  timed out. NOT a clean result and NOT a dirty one. It means the run could
+       not be completed, which is a third thing, and treating non-zero as dirty
+       here would report a stalled filesystem as a private-data leak.
+
+Keep this script, the term list, and the repository on local disk. Every stall
+observed so far has been a cloud-sync or network mount, not this code.
 """
 
 import argparse
 import os
 import re
+import signal
 import subprocess
 import sys
+import time
+
+# BOUNDED FAILURE.
+#
+# The first person to adopt this tool who was not its author hit a 120-second
+# stall that produced no output at all, and could not tell from the outside
+# whether it was slow, wedged, or blocked on a filesystem. They waited, killed
+# it, and went back to running the checks by hand. That is the worst outcome
+# available: a gate that hangs is more damaging than a gate that is missing,
+# because a missing gate is visible and a hanging one teaches its operator to
+# route around it permanently after a single encounter.
+#
+# The scanning itself was never the problem, and was measured at roughly four
+# orders of magnitude faster than the observed stall. What was wrong is that
+# every blocking operation here was unbounded and the tool said nothing until
+# it had finished. Reading the term list, shelling out to git, and walking a
+# tree can each block forever, and on a network or file-provider mount they
+# genuinely do.
+#
+# So silence had to carry the explanation, and silence cannot: an absence
+# cannot report its own cause. The report has to come from something that
+# OUTLIVES or PRECEDES the thing being described, which is what a startup line
+# and a watchdog are. Same rule as the run manifest that records unrun steps,
+# one layer down and aimed at this tool's own behaviour.
+#
+# KNOWN LIMIT, stated because the fix reads more complete than it is: this
+# bounds everything from process start onward. It cannot bound getting to
+# process start. If the interpreter stalls READING THIS FILE, because the
+# script itself sits on a stalled mount, nothing below has run yet and nothing
+# below can help. Keep the scanner on local disk.
+
+
+class StageTimeout(Exception):
+    """Raised when the watchdog fires. Carries the stage that was in flight."""
+
+
+_STAGE = "starting up"
+_ARMED = False
+
+
+def set_stage(what):
+    """Name the operation in flight, so a timeout can say WHICH one blocked.
+
+    'timed out' on its own sends the reader back to guessing, which is the
+    state this whole change exists to remove.
+    """
+    global _STAGE
+    _STAGE = what
+
+
+def install_watchdog(seconds):
+    """Bound the whole run rather than each call we happened to predict.
+
+    Deliberately a single SIGALRM around everything instead of a timeout
+    argument on each blocking call. The stall that prompted this was in
+    open(), which takes no timeout, and the next one will be somewhere nobody
+    listed either. A watchdog covers operations that have not been thought of;
+    a per-call timeout only covers the ones that have.
+    """
+    global _ARMED
+    if not seconds or seconds <= 0 or not hasattr(signal, "SIGALRM"):
+        return False
+
+    def _fire(_signum, _frame):
+        raise StageTimeout(_STAGE)
+
+    signal.signal(signal.SIGALRM, _fire)
+    signal.alarm(int(seconds))
+    _ARMED = True
+    return True
+
+
+def cancel_watchdog():
+    """Disarm. Leaving an alarm armed past the work it was guarding would fire
+    into unrelated code later and report the wrong stage, which is worse than
+    not guarding at all."""
+    global _ARMED
+    if _ARMED and hasattr(signal, "SIGALRM"):
+        signal.alarm(0)
+        _ARMED = False
 
 # Family contract. Asserted by scripts/family_check.py.
 # Corrected during dogfooding, and the correction is worth keeping. This first
@@ -122,10 +217,11 @@ def build_term_rx(terms):
     return re.compile(r"\b(" + "|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True)) + r")\b", re.I)
 
 
-def added_lines(diff_ref=None, paths=None):
+def added_lines(diff_ref=None, paths=None, timeout=None):
     """Added lines as (path, lineno_in_new_file, text)."""
     if paths:
         out = []
+        set_stage(f"walking {len(paths)} path(s) on disk: {', '.join(paths[:3])}")
         for p in paths:
             for root, _, files in os.walk(p) if os.path.isdir(p) else [(None, None, None)]:
                 if root is None:
@@ -143,10 +239,45 @@ def added_lines(diff_ref=None, paths=None):
 
     cmd = ["git", "diff", "--unified=0"]
     cmd += [diff_ref] if diff_ref else ["--cached"]
+    set_stage(f"running: {' '.join(cmd)}")
+    # Popen rather than run(), specifically so the child is killed on EITHER
+    # timeout path. This was written first as run(timeout=...) with a comment
+    # claiming nothing would be left running, and testing it showed the
+    # watchdog usually wins the race, raises through run(), and leaves git
+    # alive. A scanner that leaks a stuck process every time it gives up would
+    # make a stalled mount progressively worse each time someone retried.
+    def _kill(p):
+        # The whole process GROUP, not the process. Killing only the direct
+        # child was tried and tested: git's own children survive it, so a
+        # timed-out run left a stuck process behind every time. start_new_session
+        # puts git in its own group so the group can be killed as a unit, and
+        # has the side benefit of detaching it from the terminal, so it cannot
+        # sit waiting on a prompt nobody is there to answer.
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            p.kill()
+        try:
+            p.communicate(timeout=5)
+        except Exception:
+            pass
+
     try:
-        raw = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+    except FileNotFoundError as exc:
         raise SystemExit(f"cannot read diff: {exc}")
+    try:
+        raw, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill(proc)
+        raise StageTimeout(f"running: {' '.join(cmd)}")
+    except StageTimeout:
+        _kill(proc)
+        raise
+    if proc.returncode != 0:
+        raise SystemExit(f"cannot read diff: git exited {proc.returncode}: {err.strip()}")
 
     out, path, lineno = [], None, 0
     for line in raw.splitlines():
@@ -278,13 +409,31 @@ def main():
                     help="gate copies of these scanners too. Off by default: their "
                          "self-test fixtures are made of deliberately dirty strings.")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--timeout", type=int, default=30, metavar="SECONDS",
+                    help="give up after this long and say which stage was in "
+                         "flight. 0 disables. Default 30, which is about 300x "
+                         "the slowest legitimate run measured.")
     args = ap.parse_args()
 
     if args.self_test:
         return self_test()
 
+    started = time.time()
+    # FIRST, before anything that can block. On a stalled mount this line is
+    # the only thing the operator will ever see, and it is the difference
+    # between "it is wedged reading the term list" and 120 seconds of nothing.
+    where = args.diff or ("the working tree" if args.paths else "staged changes")
+    print(f"private_scan: terms={args.terms or 'NONE'} target={where} "
+          f"timeout={args.timeout or 'off'}s", flush=True)
+
+    if not install_watchdog(args.timeout):
+        if args.timeout:
+            print("NOTE: no SIGALRM on this platform, so the run is NOT time-bounded.",
+                  flush=True)
+
     term_rx, guards = None, []
     if args.terms:
+        set_stage(f"reading the term list at {args.terms}")
         terms, guards = load_terms(args.terms)
         term_rx = build_term_rx(terms)
         if "example" in os.path.basename(args.terms):
@@ -294,8 +443,13 @@ def main():
         print("NOTE: no --terms given, so only the pattern gates ran. The term gate "
               "is the one that catches client and colleague names.\n")
 
-    hits = scan(added_lines(args.diff, args.paths), term_rx, guards,
-                include_self=args.include_self)
+    t_terms = time.time()
+    lines = added_lines(args.diff, args.paths, timeout=args.timeout or None)
+    t_diff = time.time()
+    set_stage(f"scanning {len(lines)} added line(s)")
+    hits = scan(lines, term_rx, guards, include_self=args.include_self)
+    t_scan = time.time()
+    cancel_watchdog()
     errors = 0
     for path, lineno, gid, txt, sev, note in hits:
         if sev == "error":
@@ -305,11 +459,30 @@ def main():
 
     if not hits:
         print("no hits.")
-    print(f"\n{errors} error(s), {len(hits) - errors} downgraded, across the added lines.")
+    print(f"\n{errors} error(s), {len(hits) - errors} downgraded, across {len(lines)} added line(s).")
+    # Timings, so the next person who thinks this is slow reports WHERE rather
+    # than that it hung. The archaeology this replaces took an hour.
+    print(f"timing: terms {t_terms - started:.2f}s, diff {t_diff - t_terms:.2f}s, "
+          f"scan {t_scan - t_diff:.2f}s")
     print("NOTE: this scans ADDED LINES ONLY. A clean run means you are not making")
     print("      it worse. It does not mean the repository is clean.")
     return 1 if errors else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except StageTimeout as exc:
+        cancel_watchdog()
+        # Exit 3, distinct from 1. "Found leaks" and "could not tell whether
+        # there are leaks" are opposite results and must not share a code: a
+        # caller that treats non-zero as dirty would report a stalled mount as
+        # a private-data leak, and one that treats only 1 as dirty would let a
+        # timed-out run pass for clean.
+        print(f"\nTIMED OUT while: {exc}", file=sys.stderr)
+        print("This is almost never the scanning, which is fast. It is a blocked read.\n"
+              "Check whether the term list, the scanner itself, or the repository sits\n"
+              "on a network or cloud-sync mount, which can stall for minutes on a cold\n"
+              "open. Keep all three on local disk. Raise --timeout only after you know\n"
+              "what was slow, never to make this message go away.", file=sys.stderr)
+        sys.exit(3)
