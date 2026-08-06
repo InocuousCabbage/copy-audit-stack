@@ -94,7 +94,25 @@ RULES = [
      "Was/now price anchoring."),
     ("EMOJI",       "warn",  re.compile(r"[\U0001F300-\U0001FAFF✀-➿☀-⛿]"),
      "Emoji. Not in external copy unless the client's brand voice uses them."),
-    ("EXCLAM",      "warn",  re.compile(r"!"),
+    # A bare r"!" matched the "!" of `a !== b`, of `if (!ok)` and of a `#!`
+    # shebang. That is not a prose tell, and consumers DO point this scanner at
+    # source: a repo whose site copy lives in .tsx has nowhere else to point it.
+    # The result was a warn-severity rule failing builds under --strict for
+    # inequality operators.
+    #
+    # An exclamation mark in prose FOLLOWS something: a word, a digit, or
+    # closing punctuation. Code operators lead ("!ok") or stand alone (" !== ").
+    # So require a preceding character that can end a clause, and refuse "!="
+    # (inequality) and "!." (the TypeScript non-null assertion before a
+    # property access).
+    #
+    # RESIDUAL, stated rather than implied: a TypeScript non-null assertion
+    # still matches when it is followed by something else that can also follow
+    # real prose, as in `const x = y!;` or `foo(bar!)`. Narrowing further would
+    # cost real hits, because "(Amazing!)" and "Wow!!!" are exactly that shape.
+    # Counting also changes: "Wow!!!" now reports one hit rather than three,
+    # which is the more useful reading for a rule about an author's rate.
+    ("EXCLAM",      "warn",  re.compile(r"(?<=[A-Za-z0-9,;:'\")\]])!(?![=.])"),
      "Exclamation mark. Rare in most published business prose; measure your "
      "writer's rate before deciding what counts as too many."),
 ]
@@ -254,6 +272,28 @@ An em dash — right here.
 #   4  apostrophe must not open a span
 #   5  unbalanced quote must not swallow the rest of the line
 #   6  QUOTED USE: attribution present, so no downgrade at all (the review case)
+# EXCLAM fixture. Both directions, because the failure this rule shipped with
+# was a false POSITIVE and a fix aimed only at that is one edit away from a rule
+# that never fires at all. Lines 1 to 4 must stay silent, lines 5 to 8 must fire.
+# Line numbers are asserted below, so keep them in sync if you edit this.
+#   1  inequality operators, the case that failed real builds
+#   2  loose inequality
+#   3  logical NOT, leading position
+#   4  shebang
+#   5  plain sentence exclamation
+#   6  exclamation inside markup, so the rule is not defeated by a tag
+#   7  exclamation before closing punctuation
+#   8  repeated exclamation, counted once
+EXCLAM_TEST = """if (typeof window !== "undefined" && window.gtag !== undefined) {
+if (a != b) return;
+if (!ok) return null;
+#!/usr/bin/env node
+Order now! Limited spots.
+<p>Get started today!</p>
+(Amazing!)
+Wow!!!
+"""
+
 QUOTE_TEST = """Emails that open with "I hope this finds you well" are the tell.
 Banners that promise "limited spots available" give the game away.
 Actual copy: limited spots available.
@@ -313,6 +353,48 @@ def main():
             return 2
         print(f"skip-self PASSED: identifies vendored copies, spares lookalikes, "
               f"and own source still yields {len(own)} hits when included.")
+
+        # EXCLAM, both bounds. The must-REFUSE lines are the regression this
+        # rule shipped with; the must-CATCH lines are what stops the fix from
+        # being "delete the rule". Neither half is sufficient alone.
+        fd, tmp = tempfile.mkstemp(suffix=".txt")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(EXCLAM_TEST)
+        ehits, _ = scan(tmp, skip_meta=False)
+        os.unlink(tmp)
+
+        efail = []
+        exclam_lines = [h[0] for h in ehits if h[1] == "EXCLAM"]
+        must_refuse = [
+            (1, "inequality operators (!==)"),
+            (2, "loose inequality (!=)"),
+            (3, "logical NOT in leading position"),
+            (4, "shebang"),
+        ]
+        must_catch = [
+            (5, "plain sentence exclamation"),
+            (6, "exclamation inside markup"),
+            (7, "exclamation before closing punctuation"),
+            (8, "repeated exclamation"),
+        ]
+        for line_no, what in must_refuse:
+            if line_no in exclam_lines:
+                efail.append(f"EXCLAM line {line_no}: fired on {what}, must not")
+        for line_no, what in must_catch:
+            if line_no not in exclam_lines:
+                efail.append(f"EXCLAM line {line_no}: did not fire on {what}, must")
+        # "Wow!!!" is one exclamation event, not three. Pinned because the
+        # obvious narrowing of this rule silently drops it to zero.
+        repeated = len([l for l in exclam_lines if l == 8])
+        if repeated != 1:
+            efail.append(f"EXCLAM line 8: {repeated} hits for a repeated "
+                         f"exclamation, expected exactly 1")
+        if efail:
+            for f in efail:
+                print(f"SELF-TEST FAILED: {f}")
+            return 2
+        print(f"EXCLAM PASSED: silent on 4 code constructs, fires on 4 prose "
+              f"exclamations, and counts a repeated run once.")
 
         # Quoted-span downgrade, all bounds. The mention case is the easy one;
         # the load-bearing assertions are 3 to 6, which prove the downgrade does
