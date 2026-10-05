@@ -207,14 +207,20 @@ def walk(paths):
                     yield os.path.join(root, f)
 
 
-def strings_in(src, path):
+def strings_in(src, path, keep_lines=None):
     """Pull copy-shaped strings out of one blob of source. Shared by tree mode
-    and diff mode so the two can never drift in what counts as copy."""
+    and diff mode so the two can never drift in what counts as copy.
+
+    keep_lines: diff mode passes the 1-based line numbers that the diff
+    actually changed. The rest of src is unchanged context, present only so
+    the LOGGISH lookbehind can see a call site on an untouched line. A string
+    is reported only if its span touches a changed line."""
     found = []
-    # drop import lines and comments, which carry non-copy strings
+    # drop import lines and comments, which carry non-copy strings. Block
+    # comments keep their newlines so line numbers stay exact for keep_lines.
     src = re.sub(r"(?m)^\s*import .*$", "", src)
     src = re.sub(r"//[^\n]*", "", src)
-    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    src = re.sub(r"/\*.*?\*/", lambda c: "\n" * c.group(0).count("\n"), src, flags=re.S)
     matches = list(STRING_RE.finditer(src)) + list(TEMPLATE_RE.finditer(src))
     for m in matches:
         val = m.group("val")
@@ -229,6 +235,10 @@ def strings_in(src, path):
         if LOGGISH.search(before):
             continue
         line = src[: m.start()].count("\n") + 1
+        if keep_lines is not None:
+            span = range(line, line + m.group(0).count("\n") + 1)
+            if not any(n in keep_lines for n in span):
+                continue
         key = m.groupdict().get("key")
         found.append((genre_for(key, path), path, line, val))
     return found
@@ -294,7 +304,9 @@ def extract_from_diff(ref, repo=".", include=None, exclude=None, skip_self=True)
     import subprocess
     try:
         out = subprocess.run(
-            ["git", "-C", repo, "diff", "--unified=0", "--no-color", ref],
+            # 3 lines of context, not 0: a log call whose `console.warn(` line is
+            # unchanged must still be visible to the LOGGISH lookbehind.
+            ["git", "-C", repo, "diff", "--unified=3", "--no-color", ref],
             capture_output=True, text=True, check=True).stdout
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         raise RuntimeError(f"git diff failed: {exc}") from exc
@@ -304,7 +316,11 @@ def extract_from_diff(ref, repo=".", include=None, exclude=None, skip_self=True)
 def copy_in_diff_text(diff, include=None, exclude=None, skip_self=True):
     """Split out from extract_from_diff so it can be tested on diff text
     directly, without needing a subprocess."""
-    added, removed, path = {}, {}, None
+    # Each side is rebuilt as context + its own changed lines, in order, so a
+    # call site on an unchanged line still precedes its string. The changed
+    # line numbers are tracked so only strings touching them are reported.
+    # Hunks are separated by a blank line so one hunk cannot bleed into the next.
+    new_side, old_side, new_keep, old_keep, path = {}, {}, {}, {}, None
     for line in diff.split("\n"):
         if line.startswith("+++ b/"):
             p = line[6:].strip()
@@ -313,14 +329,24 @@ def copy_in_diff_text(diff, include=None, exclude=None, skip_self=True):
                          and not any(d in p.split("/") for d in SKIP_DIR)
                          and _path_allowed(p, include, exclude, skip_self)) else None
             continue
-        if line.startswith(("--- ", "+++ ", "@@", "diff --git", "index ")):
+        if line.startswith("@@"):
+            if path is not None:
+                for side in (new_side, old_side):
+                    side.setdefault(path, []).append("")
+            continue
+        if line.startswith(("--- ", "+++ ", "diff --git", "index ", "\\ No newline")):
             continue
         if path is None:
             continue
         if line.startswith("+"):
-            added.setdefault(path, []).append(line[1:])
+            new_side.setdefault(path, []).append(line[1:])
+            new_keep.setdefault(path, set()).add(len(new_side[path]))
         elif line.startswith("-"):
-            removed.setdefault(path, []).append(line[1:])
+            old_side.setdefault(path, []).append(line[1:])
+            old_keep.setdefault(path, set()).add(len(old_side[path]))
+        elif line.startswith(" "):
+            for side in (new_side, old_side):
+                side.setdefault(path, []).append(line[1:])
 
     # Report ADDED, REMOVED and MODIFIED. An earlier version reported only
     # additions; review corrected the rule to any diff touching a
@@ -332,9 +358,9 @@ def copy_in_diff_text(diff, include=None, exclude=None, skip_self=True):
     # exact text match on both sides of the diff. The string did not change, so
     # there is nothing to review.
     found = []
-    for p in set(added) | set(removed):
-        new = strings_in("\n".join(added.get(p, [])), p)
-        old = strings_in("\n".join(removed.get(p, [])), p)
+    for p in set(new_keep) | set(old_keep):
+        new = strings_in("\n".join(new_side.get(p, [])), p, keep_lines=new_keep.get(p, set()))
+        old = strings_in("\n".join(old_side.get(p, [])), p, keep_lines=old_keep.get(p, set()))
         new_v = {f[3] for f in new}
         old_v = {f[3] for f in old}
         found.extend([("+", ) + f for f in new if f[3] not in old_v])
@@ -490,6 +516,52 @@ def main():
                 print(f"  SELF-TEST FAILED: {f}")
             return 2
         print("  diff mode PASSED: fires on added and rewritten copy, silent on moves and utilities.")
+
+        # Call site on an UNCHANGED line. Real instance: a PR that rewrote three
+        # log messages, each on its own line under an untouched `console.warn(`,
+        # had all three flagged as ui-copy, because diff mode saw only the
+        # changed lines and the call site was context. Both bounds asserted:
+        # context must silence a log line, and must NOT silence real copy whose
+        # neighbour merely happens to be context.
+        cd = ('+++ b/src/app/api/contact/route.ts\n'
+              '@@ -10,3 +10,3 @@\n'
+              '     console.warn(\n'
+              '-      "[contact] Mail key not set. Logging submission instead of sending email."\n'
+              '+      `[contact] Mail key not set; inquiry not emailed (lead still routed onward) at ${t}`\n'
+              '     );\n'
+              '@@ -40,3 +40,3 @@\n'
+              '   /* layout note that\n'
+              '      spans two lines */\n'
+              '   const props = {\n'
+              '     subtitle: "An unchanged subtitle that must stay quiet here",\n'
+              '-    headline: "Ship the site your customers already expect",\n'
+              '+    headline: "Ship the website your customers already expect",\n'
+              '   };\n'
+              '@@ -80,2 +81,3 @@\n'
+              '   cta: "Book a free intro call this week",\n'
+              '+  footerCta: "Book a free intro call this week",\n'
+              ' };\n')
+        cres = {v for _, _, _, _, v in copy_in_diff_text(cd)}
+        cfails = []
+        for s in ("[contact] Mail key not set; inquiry not emailed (lead still routed onward) at …",
+                  "[contact] Mail key not set. Logging submission instead of sending email."):
+            if s in cres:
+                cfails.append(f"wrongly fired on a log line whose console call is context: {s!r}")
+        if "An unchanged subtitle that must stay quiet here" in cres:
+            cfails.append("reported a string on an UNCHANGED context line")
+        # Same text newly placed beside an unchanged copy of itself is a new
+        # placement and must still fire, as it did before context was read.
+        if "Book a free intro call this week" not in cres:
+            cfails.append("context copy of a string masked its newly added duplicate")
+        for s in ("Ship the website your customers already expect",
+                  "Ship the site your customers already expect"):
+            if s not in cres:
+                cfails.append(f"did not fire on copy next to unchanged context: {s!r}")
+        if cfails:
+            for f in cfails:
+                print(f"  SELF-TEST FAILED: {f}")
+            return 2
+        print("  diff context PASSED: a console call on an unchanged line silences its log text; copy still fires.")
 
         # Scoping. A repo that vendors these scanners must not be gated on the
         # scanners' own docstrings: that fired 83 times on a real vendor-install
